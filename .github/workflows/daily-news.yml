@@ -1,0 +1,78 @@
+name: Daily Finance News Push
+
+on:
+  schedule:
+    # 北京时间 19:30 = UTC 11:30
+    - cron: '30 11 * * *'
+  workflow_dispatch:  # 允许手动触发测试
+
+jobs:
+  push-news:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install feedparser requests
+
+      - name: Run news fetcher
+        env:
+          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
+        run: |
+          python <<'EOF'
+import feedparser
+import time
+import datetime
+import requests
+import os
+import json
+
+# 新闻源列表
+FEEDS = [
+    ("财新网", "https://rsshub.app/caixin/latest"),
+    ("Reuters", "https://rsshub.app/reuters/channel/chinaNews"),
+    ("Bloomberg", "https://rsshub.app/bloomberg/market"),
+    ("WSJ", "https://rsshub.app/wsj/china")
+]
+
+def translate_title(title):
+    """免费翻译英文标题为中文（DeepSeek API）"""
+    if not title or any('\u4e00' <= c <= '\u9fff' for c in title):
+        return title  # 已是中文
+    try:
+        resp = requests.post(
+            "https://api.deepseek.com/v1/chat/completions",
+            json={
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "system", "content": "你是一个翻译助手，只返回简洁的中文翻译，不要解释。"},
+                    {"role": "user", "content": f"翻译成中文：{title}"}
+                ],
+                "max_tokens": 100
+            },
+            timeout=10
+        )
+        if resp.ok:
+            data = resp.json()
+            return data['choices'][0]['message']['content'].strip()
+    except:
+        pass
+    return title
+
+# 计算24小时前的时间
+now = datetime.datetime.now(datetime.timezone.utc)
+cutoff = now - datetime.timedelta(hours=24)
+
+all_news = []
+for source_name, url in FEEDS:
+    try:
+        feed = feedparser.parse(url)
+        for entry in feed.entries[:10]:  # 每个源最多取10条
+            pub_time = getattr(entry, '
