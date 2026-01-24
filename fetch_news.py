@@ -1,86 +1,91 @@
-import feedparser
-import time
-import datetime
 import requests
 import os
-import json
+import urllib.parse
+from datetime import datetime, timedelta
 
-# 新闻源列表
-FEEDS = [
-    ("财新网", "https://rsshub.app/caixin/latest"),
-    ("Reuters", "https://rsshub.app/reuters/channel/chinaNews"),
-    ("Bloomberg", "https://rsshub.app/bloomberg/market"),
-    ("WSJ", "https://rsshub.app/wsj/china")
-]
+MARKETAUX_KEY = os.getenv("MARKETAUX_API_KEY")
+WECHAT_WEBHOOK = os.getenv("WECHAT_WEBHOOK")
 
-def translate_title(title):
-    """免费翻译英文标题为中文（DeepSeek API）"""
-    if not title or any('\u4e00' <= c <= '\u9fff' for c in title):
-        return title  # 已是中文
+# 核心白名单信源
+WHITELIST_SOURCES = ["Bloomberg", "Reuters", "The Wall Street Journal", "CNBC", "Financial Times", "MarketWatch", "Forbes"]
+
+def google_translate(text):
+    """强制使用 Google 翻译镜像"""
     try:
-        resp = requests.post(
-            "https://api.deepseek.com/v1/chat/completions",
-            json={
-                "model": "deepseek-chat",
-                "messages": [
-                    {"role": "system", "content": "你是一个翻译助手，只返回简洁的中文翻译，不要解释。"},
-                    {"role": "user", "content": f"翻译成中文：{title}"}
-                ],
-                "max_tokens": 100
-            },
-            timeout=10
-        )
-        if resp.ok:
-            data = resp.json()
-            return data['choices'][0]['message']['content'].strip()
-    except Exception as e:
-        print(f"翻译失败: {e}")
-        return title
-      # 计算24小时前的时间
-now = datetime.datetime.now(datetime.timezone.utc)
-cutoff = now - datetime.timedelta(hours=24)
+        encoded_text = urllib.parse.quote(text[:400])
+        url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=zh-CN&dt=t&q={encoded_text}"
+        r = requests.get(url, timeout=10)
+        return "".join([s[0] for s in r.json()[0]])
+    except:
+        return text
 
-all_news = []
-for source_name, url in FEEDS:
+def fetch_data(params):
+    """通用抓取函数"""
+    base_url = "https://api.marketaux.com/v1/news/all"
+    params.update({"api_token": MARKETAUX_KEY, "language": "en", "limit": 10})
     try:
-        feed = feedparser.parse(url)
-        for entry in feed.entries[:10]:  # 每个源最多取10条
-            pub_time = getattr(entry, 'published_parsed', None)
-            if not pub_time:
-                continue
-            pub_dt = datetime.datetime(*pub_time[:6], tzinfo=datetime.timezone.utc)
-            if pub_dt >= cutoff:
-                title_zh = translate_title(entry.title)
-                all_news.append({
-                    'title': title_zh,
-                    'link': entry.link,
-                    'source': source_name,
-                    'pub_dt': pub_dt
-                })
-    except Exception as e:
-        print(f"Error fetching {source_name}: {e}")
+        res = requests.get(base_url, params=params, timeout=15).json()
+        return res.get('data', [])
+    except:
+        return []
 
-# 按时间排序（最新在前）
-all_news.sort(key=lambda x: x['pub_dt'], reverse=True)
+def get_integrated_report():
+    # 1. 获取宏观金融 (美债, 黄金, 指数, 欧日市场)
+    macro_params = {
+        "entity_types": "index,commodity,currency",
+        "published_after": (datetime.now() - timedelta(hours=24)).strftime('%Y-%m-%dT%H:%M')
+    }
+    
+    # 2. 获取前沿科技 (AI, 航空航天, Web3)
+    tech_params = {
+        "search": "AI,Aerospace,Web3,SpaceX,NVIDIA,OpenAI",
+        "industries": "Technology,Industrials"
+    }
 
-# 生成消息
-if not all_news:
-    message = "过去24小时暂无重要财经新闻。"
-else:
-    text = "【过去24小时全球财经要闻】\n\n"
-    for i, item in enumerate(all_news[:8]):
-        text += f"{i+1}. {item['title']}\n来源：{item['source']}\n链接：{item['link']}\n\n"
-    text += "—— 每日19:50自动推送 | 数据源：财新/Reuters/Bloomberg/WSJ"
-    message = text
+    raw_news = fetch_data(macro_params) + fetch_data(tech_params)
+    
+    # 筛选与去重
+    final_items = []
+    seen_titles = set()
+    
+    for item in raw_news:
+        title = item.get('title', '')
+        source = item.get('source', '')
+        
+        # 仅保留白名单信源或极高质量源
+        is_pro_source = any(ws in source for ws in WHITELIST_SOURCES)
+        
+        if title not in seen_titles and is_pro_source:
+            zh_title = google_translate(title)
+            
+            # 转换时间
+            pub_at = item.get('published_at', '')
+            time_str = "NEW"
+            if pub_at:
+                dt = datetime.strptime(pub_at, '%Y-%m-%dT%H:%M:%S.%fZ') + timedelta(hours=8)
+                time_str = dt.strftime('%H:%M')
+            
+            final_items.append({
+                "time": time_str,
+                "source": source,
+                "title": zh_title
+            })
+            seen_titles.add(title)
 
-# 发送到企业微信
-webhook = os.getenv("WECHAT_WEBHOOK")
-if webhook:
-    try:
-        requests.post(webhook, json={"msgtype": "text", "text": {"content": message}})
-        print("✅ 推送成功！")
-    except Exception as e:
-        print(f"❌ 推送失败: {e}")
-else:
-    print("⚠ 未设置 WECHAT_WEBHOOK，消息预览：")
-    print(message)
+    if not final_items:
+        return "### 🌐 顶级财经内参\n> 监测中：暂无来自 WSJ/Bloomberg 的实时核心快讯。"
+
+    # 构建排版
+    now_bj = (datetime.now() + timedelta(hours=8)).strftime('%m-%d %H:%M')
+    content = f"### 🌐 顶级财经内参 (华尔街专线)\n> 覆盖：宏观金融 | AI | 航天 | Web3\n> 更新时间：{now_bj}\n\n"
+    
+    for i, news in enumerate(final_items[:12], 1): # 取前12条精华
+        content += f"{i}. **[{news['time']}]** {news['title']}\n   *信源: {news['source']}*\n\n"
+    
+    content += "---\n> ⚡ 仅推送 Bloomberg/Reuters/WSJ 等专业信源"
+    return content
+
+if __name__ == "__main__":
+    report = get_integrated_report()
+    if WECHAT_WEBHOOK:
+        requests.post(WECHAT_WEBHOOK, json={"msgtype": "markdown", "markdown": {"content": report}})
